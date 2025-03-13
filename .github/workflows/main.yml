@@ -1,0 +1,84 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-1
+
+      - name: Install AWS CLI
+        uses: unfor19/install-aws-cli-action@v1
+        with:
+          version: 2
+
+      - name: Authenticate ECR
+        run: |
+          aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin 305454269050.dkr.ecr.us-west-1.amazonaws.com
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          push: true
+          tags: 305454269050.dkr.ecr.us-west-1.amazonaws.com/lock-round-input:latest
+
+      - name: Check if IAM Role Exists
+        id: check_iam_role
+        run: |
+          ROLE_EXISTS=$(aws iam get-role --role-name github-actions-deploy 2>/dev/null || echo "NOT_FOUND")
+          if [[ "$ROLE_EXISTS" == "NOT_FOUND" ]]; then
+            echo "IAM_ROLE_EXISTS=false" >> $GITHUB_ENV
+          else
+            echo "IAM_ROLE_EXISTS=true" >> $GITHUB_ENV
+          fi
+
+      - name: Check if Lambda Function Exists and Package Type
+        id: check_lambda
+        run: |
+          FUNCTION_INFO=$(aws lambda get-function --function-name lock-round-input --region us-west-1 2>/dev/null || echo "NOT_FOUND")
+          
+          if [[ "$FUNCTION_INFO" == "NOT_FOUND" ]]; then
+            echo "LAMBDA_EXISTS=false" >> $GITHUB_ENV
+            echo "LAMBDA_PACKAGE_TYPE=NONE" >> $GITHUB_ENV
+          else
+            PACKAGE_TYPE=$(echo $FUNCTION_INFO | jq -r '.Configuration.PackageType')
+            echo "LAMBDA_EXISTS=true" >> $GITHUB_ENV
+            echo "LAMBDA_PACKAGE_TYPE=$PACKAGE_TYPE" >> $GITHUB_ENV
+          fi
+
+      - name: Delete Existing Lambda If It's a Zip Package
+        if: env.LAMBDA_EXISTS == 'true' && env.LAMBDA_PACKAGE_TYPE == 'Zip'
+        run: |
+          aws lambda delete-function --function-name lock-round-input --region us-west-1
+          echo "Deleted existing Lambda function because it was using a Zip package."
+
+      - name: Create New Lambda Function (If Not Exists or Was Deleted)
+        if: env.LAMBDA_EXISTS == 'false' || env.LAMBDA_PACKAGE_TYPE == 'Zip'
+        run: |
+          aws lambda create-function \
+            --function-name lock-round-input \
+            --package-type Image \
+            --code ImageUri=305454269050.dkr.ecr.us-west-1.amazonaws.com/lock-round-input:latest \
+            --role arn:aws:iam::305454269050:role/github-actions-deploy \
+            --region us-west-1
+
+      - name: Update Lambda Function (If Exists and Is a Container Image)
+        if: env.LAMBDA_EXISTS == 'true' && env.LAMBDA_PACKAGE_TYPE == 'Image'
+        run: |
+          aws lambda update-function-code \
+            --function-name lock-round-input \
+            --image-uri 305454269050.dkr.ecr.us-west-1.amazonaws.com/lock-round-input:latest \
+            --region us-west-1
