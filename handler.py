@@ -1,23 +1,46 @@
+import os
 import json
 import boto3
+import pytz
 
-APIGW_ENDPOINT = "https://6jvamzra4m.execute-api.us-west-1.amazonaws.com/production"
-dynamodb = boto3.client('dynamodb')
-apigateway = boto3.client('apigatewaymanagementapi', endpoint_url=APIGW_ENDPOINT)
+from datetime import datetime
+
+DYNAMO_CACHE = os.getenv("DYNAMO_CACHE")
+APIGW_ENDPOINT = os.getenv("APIGW_ENDPOINT")
+
+dynamodb = boto3.resource("dynamodb")
+dynamo_conn = boto3.client("dynamodb")
+apigateway = boto3.client("apigatewaymanagementapi", endpoint_url=APIGW_ENDPOINT)
 
 
 def main(*_, **__):
     try:
-        response = dynamodb.scan(TableName="GolfNutsLiveConnections")
-        connection_ids = [item['connection_id']['S'] for item in response.get('Items', [])]
+        cache = dynamodb.Table(DYNAMO_CACHE)
+        tournament = get_tournament(cache)
+
+        tourn_tz = pytz.timezone(tournament["tournament_tz"])
+        tourn_dttm = datetime.now(tourn_tz)
+        weekday = tourn_dttm.weekday()
 
         message = {
             "action": "round-start",
-            "isRoundOneStart": True,
-            "isRoundTwoStart": False,
-            "isRoundThreeStart": False,
-            "isRoundFourStart": False,
+            "isRoundOneStart": weekday >= 3,
+            "isRoundTwoStart": weekday >= 4,
+            "isRoundThreeStart": weekday >= 5,
+            "isRoundFourStart": weekday >= 6,
         }
+
+        # Farmer's Insurance
+        # message = {
+        #     "action": "round-start",
+        #     "isRoundOneStart": weekday >= 2,
+        #     "isRoundTwoStart": weekday >= 3,
+        #     "isRoundThreeStart": weekday >= 4,
+        #     "isRoundFourStart": weekday >= 5,
+        # }
+
+        response = dynamo_conn.scan(TableName="GolfNutsLiveConnections")
+        connection_ids = [item['connection_id']['S'] for item in response.get('Items', [])]
 
         for connection_id in connection_ids:
             try:
@@ -37,6 +60,12 @@ def main(*_, **__):
             'statusCode': 500,
             'body': f"Error: {str(e)}"
         }
+
+
+def get_tournament(cache):
+    response = cache.get_item(Key={"cache_id": "current"})
+    tournament = response.get("Item")
+    return tournament
 
 
 if __name__ == "__main__":
